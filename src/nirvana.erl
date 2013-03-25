@@ -2,10 +2,14 @@
 
 
 -export([init/0,
+         add_user/0,
+         add_user/1,
          add_user/2,
          add_user/3,
          add_route/2,
+         add_token/1,
          add_username/2,
+         get_token/1,
          get_route_by_uid/1,
          get_username/1,
          get_route_by_username/1,
@@ -15,13 +19,15 @@
          rand/1]).
 
 -define(MaxUsers,1000).
--define(Tables, [nirvana_routes, nirvana_usernames]).
+-define(Tables, [nirvana_routes, nirvana_usernames, nirvana_tokens]).
 
 -record(nirvana_routes, {uid :: binary(), node :: node()}).
--record(nirvana_usernames, {username :: binary(), uid :: binary()}).
+-record(nirvana_usernames, {username :: binary(), password :: binary() | none, uid :: binary()}).
+-record(nirvana_tokens, {token :: binary(), uid :: binary()}).
 
 -type route() :: #nirvana_routes{}.
 -type username() ::#nirvana_usernames{}.
+-type token() :: #nirvana_tokens{}.
 
 
 %% @doc a helper getting a node up and going
@@ -80,38 +86,109 @@ create_table(nirvana_usernames, Nodes) ->
     mnesia:create_table(nirvana_usernames,
         [{attributes, record_info(fields, nirvana_usernames)},
          {disc_copies, Nodes},
+         {type, set}]);
+create_table(nirvana_tokens, Nodes) ->
+    mnesia:create_table(nirvana_tokens,
+        [{attributes, record_info(fields, nirvana_tokens)},
+         {disc_copies, Nodes},
          {type, set}]).
 
 %%
 %% Users interface
 %%
 
--spec add_user(binary(), binary()) -> {aborted, _} | {atomic, ok}.
-add_user(Uid, Username) ->
-    add_user(Uid, Username, node()).
+%% @doc create a user on this node, automatically generating
+%% the uid and username
+add_user() ->
+    Uid = uuid:get_v4(),
+    Friendly = list_to_binary(uuid:uuid_to_string(Uid)),
+    add_user(Uid, <<"sherpa:", Friendly/binary>>).
 
--spec add_user(binary(), binary(), node()) -> {aborted, _} | {atomic, ok}.
-add_user(Uid, Username, Node) ->
-    mnesia:transaction(fun() ->
-                case {add_route(Uid, Node), add_username(Username, Uid)} of
-                    {{atomic, ok}, {atomic, ok}} ->
-                        ok;
-                    Else ->
-                        Else
-                end
-        end).
+add_user(Username) ->
+    add_user(Username, uuid:get_v4()).
+
+add_user(Username, Uid) ->
+    add_user(Uid, Username, none).
+
+add_user(Username, Uid, Password) ->
+    add_user(Username, Uid, Password, node()).
+
+add_user(Username, Uid, Password, Node) ->
+    Fun = fun() ->
+            case {add_route(Uid, Node), add_username(Username, Password, Uid), add_token(Uid)} of
+                {{ok, _}, {ok, _}, {ok, {Token, _}}} ->
+                    {ok, [{uid, Uid},
+                            {username, Username},
+                            {token, Token},
+                            {node, Node}]};
+                Else ->
+                    {error, Else}
+            end
+    end,
+    add_user(Username, Uid, Password, Node, mnesia:transaction(Fun)).
+
+add_user(_Username, _Uid, _Password, _Node, {aborted, Reason})       -> {error, Reason};
+add_user(_Username, _Uid, _Password, _Node, {atomic, {ok, Result}})  -> {ok, Result}.
+
 
 -spec add_route(binary(), node()) -> {aborted, _} | {atomic, ok}.
 add_route(Uid, Node) ->
-    mnesia:transaction(fun() ->
-                mnesia:write(#nirvana_routes{uid=Uid, node=Node})
-        end).
+    Fun = fun() ->
+            mnesia:write(#nirvana_routes{uid=Uid, node=Node})
+    end,
+    case mnesia:transaction(Fun) of
+        {aborted, Reason} ->
+            {error, Reason};
+        {atomic, ok} ->
+            {ok, {Uid, Node}}
+    end.
 
--spec add_username(binary(), binary()) -> {aborted, _} | {atomic, ok}.
-add_username(Username, Uid) ->
-    mnesia:transaction(fun() ->
-                mnesia:write(#nirvana_usernames{username=Username, uid=Uid})
-        end).
+-spec add_username(binary(), binary(), binary()) -> {aborted, _} | {atomic, ok}.
+add_username(Username, Password, Uid) ->
+    Fun = fun() ->
+            mnesia:write(#nirvana_usernames{username=Username,
+                                            uid=Uid,
+                                            password=Password})
+    end,
+    case mnesia:transaction(Fun) of
+        {aborted, Reason} ->
+            {error, Reason};
+        {atomic, ok} ->
+            {ok, {Username, Uid}}
+    end.
+
+-spec add_token(U) -> {error, _} | {ok, {binary(), U}}.
+add_token(Uid) ->
+    add_token(token(Uid), Uid).
+
+-spec add_token(T, U) -> {error, _} | {ok, {T, U}}.
+add_token(Token, Uid) ->
+    Fun = fun() ->
+            mnesia:write(#nirvana_tokens{token=Token, uid=Uid})
+    end,
+    case mnesia:transaction(Fun) of
+        {aborted, Reason} ->
+            {error, Reason};
+        {atomic, ok} ->
+            {ok, {Token, Uid}}
+    end.
+
+%% Help for user properties
+
+token(Uid) ->
+    token(Uid, calendar:now_to_datetime(erlang:now())).
+
+token(Uid, Datetime) ->
+    Timestamp = timestamp(Datetime),
+    Readable = list_to_binary(uuid:uuid_to_string(Uid)),
+    Rand = list_to_binary(io_lib:format("~..0B", [random:uniform(1 bsl 64) + (1 bsl 32)])),
+    <<Timestamp/binary, ".", Readable/binary, ".", Rand/binary>>.
+
+timestamp({{Y, M, D}, {H, Mi, S}}) ->
+    list_to_binary(io_lib:format("~4..0B~2..0B~2..0B.~2..0B~2..0B~2..0B", [Y, M, D, H, Mi, S])).
+
+
+%% Gets
 
 -spec get_route_by_uid(binary()) -> {aborted, _} | {atomic, route() | undefined}.
 get_route_by_uid(Uid) ->
@@ -129,8 +206,19 @@ get_route_by_uid(Uid) ->
 get_username(Username) ->
     mnesia:transaction(fun() ->
                 case mnesia:read({nirvana_usernames, Username}) of
-                    [#nirvana_usernames{uid=Uid}] ->
-                        {Username, Uid};
+                    [#nirvana_usernames{password=Password, uid=Uid}] ->
+                        {Username, Password, Uid};
+                    [] ->
+                        undefined
+                end
+        end).
+
+-spec get_token(binary()) -> {aborted, _} | {atomic, token() | undefined}.
+get_token(Token) ->
+    mnesia:transaction(fun() ->
+                case mnesia:read({nirvana_tokens, Token}) of
+                    [#nirvana_tokens{uid=Uid}] ->
+                        {Token, Uid};
                     [] ->
                         undefined
                 end
@@ -195,21 +283,14 @@ hungries() ->
 
 -spec hungries([node()]) -> node().
 hungries(Nodes) ->
-    case lists:filter(fun hungry/1, Nodes) of
-        [] ->
-            [];
-        Else ->
-            Else
-    end.
+    lists:filter(fun hungry/1, Nodes).
 
 -spec hungry(node()) -> true | false.
 hungry(Node) ->
-    case count_users_on(Node) of
-        {atomic, Count} ->
-            Count < ?MaxUsers;
-        {aborted, _} ->
-            false
-    end.
+    hungry(Node, count_users_on(Node)).
+
+hungry(_Node, {atomic, Count}) -> Count < ?MaxUsers;
+hungry(_Node, {aborted, _})    -> false.
 
 
 %%
