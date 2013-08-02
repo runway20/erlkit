@@ -64,17 +64,17 @@ count(Stat) ->
     count(Stat, 1).
 
 count(Stat, Count) ->
-    gen_server:cast(?MODULE, {count, Stat, Count}).
+    gen_server:cast(?MODULE, {ez_count, Stat, Count}).
 
 count(Ezkey, Stat, Count) ->
-    gen_server:cast(?MODULE, {count, Ezkey, Stat, Count}).
+    gen_server:cast(?MODULE, {ez_count, Ezkey, Stat, Count}).
 
 %% @doc Post a value using the ezkey
 value(Stat, Value) ->
-    gen_server:cast(?MODULE, {value, Stat, Value}).
+    gen_server:cast(?MODULE, {ez_value, Stat, Value}).
 
 value(Ezkey, Stat, Value) ->
-    gen_server:cast(?MODULE, {value, Ezkey, Stat, Value}).
+    gen_server:cast(?MODULE, {ez_value, Ezkey, Stat, Value}).
 
 
 % gen_server callbacks
